@@ -1,78 +1,68 @@
-#!/usr/bin/env python
-
+from pid import PID
+from lowpass import LowPassFilter
+from yaw_controller import YawController
 import rospy
-from geometry_msgs.msg import PoseStamped
-from styx_msgs.msg import Lane, Waypoint
-
-import math
-
-'''
-This node will publish waypoints from the car's current position to some `x` distance ahead.
-
-As mentioned in the doc, you should ideally first implement a version which does not care
-about traffic lights or obstacles.
-
-Once you have created dbw_node, you will update this node to use the status of traffic lights too.
-
-Please note that our simulator also provides the exact location of traffic lights and their
-current status in `/vehicle/traffic_lights` message. You can use this message to build this node
-as well as to verify your TL classifier.
-
-TODO (for Yousuf and Aaron): Stopline location for each traffic light.
-'''
-
-LOOKAHEAD_WPS = 200 # Number of waypoints we will publish. You can change this number
 
 
-class WaypointUpdater(object):
-    def __init__(self):
-        rospy.init_node('waypoint_updater')
-
-        rospy.Subscriber('/current_pose', PoseStamped, self.pose_cb)
-        rospy.Subscriber('/base_waypoints', Lane, self.waypoints_cb)
-
-        # TODO: Add a subscriber for /traffic_waypoint and /obstacle_waypoint below
+GAS_DENSITY = 2.858
+ONE_MPH = 0.44704
 
 
-        self.final_waypoints_pub = rospy.Publisher('final_waypoints', Lane, queue_size=1)
-
-        # TODO: Add other member variables you need below
-
-        rospy.spin()
-
-    def pose_cb(self, msg):
+class Controller(object):
+    def __init__(self, vehicle_mass, fuel_capacity, brake_deadband, decel_limit, accel_limit, wheel_radius, wheel_base, steer_ratio, max_lat_accel, max_steer_angle):
         # TODO: Implement
-        pass
+        self.yaw_controller = YawController(wheel_base, steer_ratio, 0.1, max_lat_accel, max_steer_angle)
 
-    def waypoints_cb(self, waypoints):
-        # TODO: Implement
-        pass
+        kp = 0.3
+        ki = 0.1
+        kd = 0.
+        mn = 0. # min throttle value
+        mx = 0.2 # max throttle value
+        self.throttle_controller = PID(kp, ki, kp, mn, mx)
 
-    def traffic_cb(self, msg):
-        # TODO: Callback for /traffic_waypoint message. Implement
-        pass
+        tau = 0.5 # 1/(2pi*tau) = cutoff frequency
+        ts = .02 # Sample time
+        self.vel_lpf = LowPassFilter(tau, ts)
 
-    def obstacle_cb(self, msg):
-        # TODO: Callback for /obstacle_waypoint message. We will implement it later
-        pass
+        self.vehicle_mass = vehicle_mass
+        self.fuel_capacity = fuel_capacity
+        self.brake_deadband = brake_deadband
+        self.decel_limit = decel_limit
+        self.accel_limit = accel_limit
+        self.wheel_radius = wheel_radius
 
-    def get_waypoint_velocity(self, waypoint):
-        return waypoint.twist.twist.linear.x
+        self.last_time = rospy.get_time()
 
-    def set_waypoint_velocity(self, waypoints, waypoint, velocity):
-        waypoints[waypoint].twist.twist.linear.x = velocity
-
-    def distance(self, waypoints, wp1, wp2):
-        dist = 0
-        dl = lambda a, b: math.sqrt((a.x-b.x)**2 + (a.y-b.y)**2  + (a.z-b.z)**2)
-        for i in range(wp1, wp2+1):
-            dist += dl(waypoints[wp1].pose.pose.position, waypoints[i].pose.pose.position)
-            wp1 = i
-        return dist
+    def control(self, current_vel, dbw_enabled, linear_vel, angular_vel):
+        # TODO: Change the arg, kwarg list to suit your needs
+        # Return throttle, brake, steer
 
 
-if __name__ == '__main__':
-    try:
-        WaypointUpdater()
-    except rospy.ROSInterruptException:
-        rospy.logerr('Could not start waypoint updater node.')
+        if not dbw_enabled:
+        	self.throttle_controller.reset()
+        	return 0., 0., 0.
+
+        current_vel = self.vel_lpf.filt(current_vel)
+
+        steering = self.yaw_controller.get_steering(linear_vel, angular_vel, current_vel)
+
+        vel_error = linear_vel - current_vel
+        self.last_vel = current_vel
+
+        current_time = rospy.get_time()
+        sample_time = current_time - self.last_time
+        self.last_time = current_time
+
+        throttle = self.throttle_controller.step(vel_error, sample_time)
+        brake = 0
+
+        if(linear_vel == 0. and current_vel < 0.1):
+        	throttle = 0
+        	brake = 400
+
+        elif throttle < .1 and vel_error < 0:
+        	throttle = 0
+        	decel = max(vel_error, self.decel_limit)
+        	brake = abs(decel)*self.vehicle_mass*self.wheel_radius
+
+        return throttle, brake, steering
